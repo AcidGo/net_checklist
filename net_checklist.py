@@ -23,6 +23,7 @@ import fcntl
 import logging
 import platform
 import psutil
+import json
 import re
 import socket
 import struct
@@ -38,6 +39,19 @@ CHECKLIST_INVENTORY_MAP_KEY = "inventory"
 CHECKLIST_ACL_PREFIX = "acl."
 CHECKLIST_ACL_MAP_KEY = "acl"
 # EOF CONFIG
+
+class ChecklistParser(ConfigParser):
+    """Modified ConfigParser that allow ':' in keys and only '=' as separator.
+    """
+    OPTCRE_NV = re.compile(
+        r'(?P<option>[^=\s][^=]*)'      # allow only =
+        r'\s*(?:'                       # any number of space/tab,
+        r'(?P<vi>[=])\s*'               # optionally followed by
+                                        # separator (either : or
+                                        # =), followed by any #
+                                        # space/tab
+        r'(?P<value>.*))?$'             # everything up to eol
+    )
 
 def init_logger(level, logfile=None):
     """日志功能初始化。
@@ -84,6 +98,14 @@ def url_test(url, timeout=5):
     else:
         return True
 
+def result_pretty(res_dict):
+    """
+    """
+    logging.info("="*20 + " resutl " + "="*20)
+    for line in (json.dumps(res_dict, indent=4, ensure_ascii=False)).split("\n"):
+        logging.info(line)
+    logging.info("="*20 + " EOF resutl " + "="*20)
+
 def get_local_address(is_multi=False):
     """获取服务器的本地 IP 地址。
 
@@ -100,7 +122,8 @@ def get_local_address(is_multi=False):
     else:
         for net in list_all_netcards():
             res.append(get_ip_address(net))
-            res.remove("127.0.0.1")
+            if "127.0.0.1" in res:
+                res.remove("127.0.0.1")
         return res
 
 def get_ip_address(ifname):
@@ -195,7 +218,6 @@ def list_all_netcards():
             lst.append(name)
         return lst
 
-
 def parse_checklist(url):
     """解析 checklist 文件，得到如下字典形式：
         {
@@ -210,7 +232,8 @@ def parse_checklist(url):
     """
     if not url_test(url):
         raise Exception("cannot access the checklist url: {!s}".format(url))
-    config = ConfigParser(allow_no_value=True)
+    # config = ConfigParser(allow_no_value=True)
+    config = ChecklistParser(allow_no_value=True)
     r = urlopen(url)
     config.readfp(r)
     res = {CHECKLIST_INVENTORY_MAP_KEY: {}, CHECKLIST_ACL_MAP_KEY: {}}
@@ -272,28 +295,63 @@ def execute(checklist_url, socket_timeout, concurrency):
     cl_dict = parse_checklist(checklist_url)
     chk_res = {}
     local_ip = get_local_address()[0]
-    s_name = None
-    acl_list = []
+    acl_dict = {}
+    host_found = False
 
-    for s_k, s_v in cl_dict[CHECKLIST_INVENTORY_MAP_KEY]:
+    for s_k, s_v in cl_dict[CHECKLIST_INVENTORY_MAP_KEY].items():
+        s_name = None
         if local_ip in s_v:
             s_name = s_k
-    if s_name is None:
+            host_found = True
+        if not s_name:
+            continue
+        acl_dict[s_name] = cl_dict[CHECKLIST_ACL_MAP_KEY].get(s_name, [])
+
+    if not host_found:
         logging.info("the local host {!s} is not in the inventory, exit.".format(local_ip))
         return 
 
-    acl_list = cl_dict[CHECKLIST_ACL_MAP_KEY].get(s_name, [])
-    if len(acl_list) == 0:
-        logging.warning("the acl list is empty from {!s}".format(s_name))
-        return 
+    has_fail = False
+    for acl_key, acl_list in acl_dict.items():
+        if acl_key not in chk_res:
+            chk_res[acl_key] = {}
+        for dst in acl_list:
+            dst_host = dst.split(":")[0].strip()
+            dst_port = int(dst.split(":")[-1].strip())
+            if tcp_test(dst_host, dst_port, socket_timeout):
+                chk_res[acl_key][dst] = "PASS"
+            else:
+                chk_res[acl_key][dst] = "FAIL"
+                has_fail = True
 
-    for dst in acl_list:
-        dst_host = dst.split(":")[0].strip()
-        dst_port = int(dst.split(":")[-1].strip())
-        if tcp_test(dst_host, dst_port, socket_timeout):
-            chk_res[dst] = "PASS"
-        else:
-            chk_res[dst] = "FAIL"
+    result_pretty(chk_res)
 
-    logging.info("done all jobs")
+    if has_fail:
+        logging.error("found fail item in the result, please check it")
+        raise Exception("checking found fail")
+    else:
+        logging.info("checking all pass")
 
+if __name__ == "__main__":
+    # ########## Self Test
+    # INPUT_CHECKLIST_URL = "http://192.168.52.71:9090/a.ini"
+    # INPUT_SOCKET_TIMEOUT = 5
+    # INPUT_CONCURRENCY = 1
+    # ########## EOF Self Tes
+
+    init_logger(LOG_LEVEL)
+
+    # input args deal
+    INPUT_SOCKET_TIMEOUT = int(INPUT_SOCKET_TIMEOUT)
+    INPUT_CONCURRENCY = int(INPUT_CONCURRENCY)
+    # EOF input args deal
+
+    try:
+        execute(
+            checklist_url = INPUT_CHECKLIST_URL,
+            socket_timeout = INPUT_SOCKET_TIMEOUT,
+            concurrency = INPUT_CONCURRENCY,
+        )
+    except Exception as e:
+        logging.exception(e)
+        exit(1)
